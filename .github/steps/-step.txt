@@ -1,1 +1,406 @@
-1
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Feb 27 14:35:41 2025
+
+@author: dms
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Feb 26 22:57:25 2025
+T1 measurement rip off from Ramsey with mormalization. But does not work. Weird errors.
+Using AFG pulse mode because this sequence requires longer echo times. If giving single pulse, then always use pulse mode.
+@author: dms
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Nov 12 21:50:44 2024
+Gate Delays must change with GH/EF
+Integrated with AFG3102C for variable pulse width control via nspyre gateway
+Credit - Claude. 
+Note - Might need to optimize the delays a bit more. Specially for initial pulses.
+@author: dms
+AFG outputs 250 ns later than the trigger.
+"""
+
+import numpy as np
+import time
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from nspyre import DataSource
+from insmgr import MyInstrumentManager
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import threading
+import csv
+import json
+from utilities.FSM import FSMScannerGUI
+from utilities.Autofocus_lite import MainWindow as AutofocusWindow
+
+class T1Experiment:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("Rabi Experiment with AFG Control")
+        
+        # Create main frame
+        main_frame = ttk.Frame(self.master)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Create button frame at the top
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
+        
+        self.start_button = ttk.Button(button_frame, text="Start", command=self.start_experiment)
+        self.start_button.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_button = ttk.Button(button_frame, text="Stop", command=self.stop_experiment, state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT, padx=5)
+        
+        # Create plot
+        self.fig, self.ax = plt.subplots(figsize=(10, 6))
+        self.line_ratio, = self.ax.plot([], [], 'b-', label='Ratio (A/B)')
+        
+        self.ax.set_xlabel('Echo Time (ns)')
+        self.ax.set_ylabel('Contrast')
+        self.ax.set_title('T1 Measurement')
+        self.ax.legend()
+        
+        self.canvas = FigureCanvasTkAgg(self.fig, master=main_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        
+        # Create input frame at the bottom
+        input_frame = ttk.Frame(main_frame)
+        input_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=5)
+        
+        # Create input fields
+        input_fields = [
+            ("Fixed Freq (GHz):", "2.8604"),
+            ("Start Time (ns):", "10e3"),
+            ("Stop Time (ns):", "5e6"),
+            ("Step Size (ns):", "10e3"),
+            ("Burst Count:", "101"),
+            ("MW Power (dBm):", "-20"),
+            ("Init Duration (µs):", "1"),
+            ("Laser Delay (ns):", "140"),
+            ("Gate Duration (µs):", "0.5"),
+            ("Reinit Duration (µs):", "5")
+        ]
+        
+        self.entries = {}
+        row = 0
+        col = 0
+        for i, (label, default) in enumerate(input_fields):
+            ttk.Label(input_frame, text=label).grid(row=row, column=col*2, padx=2, pady=2, sticky=tk.W)
+            entry = ttk.Entry(input_frame, width=15)
+            entry.insert(0, default)
+            entry.grid(row=row, column=col*2+1, padx=2, pady=2)
+            self.entries[label] = entry
+            col += 1
+            if col > 4:  # Start a new row after 5 fields
+                col = 0
+                row += 1
+        
+        self.echo_times = []
+        self.ratios = []
+        self.running = False
+        self.gw = None
+        self.experiment_params = {}
+        
+    def setup_instruments(self, gw, burst_period, burst_count, mw_power, init_duration, total_duration_s, laser_delay, gate_duration, reinit_duration, stop_time):
+        """Configure all instruments including AFG for the experiment."""
+        
+        # Configure DG645
+        gw.DG.set_burst_mode(True)
+        gw.DG.set_burst_count(burst_count)
+        gw.DG.set_burst_period(burst_period)  # Convert to seconds
+        gw.DG.set_output_level(gw.DG.Output.T0, 1.5, 0)
+        gw.DG.set_output_level(gw.DG.Output.EF, 2, 0)
+        gw.DG.set_output_level(gw.DG.Output.GH, 1, 0)
+        gw.DG.set_output_polarity(gw.DG.Output.GH, gw.DG.LevelPolarity.NEGATIVE)
+        
+        "The AB and CD delays need to be fed because the DG does mad if they are longer than burst period. They are of no use in the measurement but can be used to check delays using the oscilloscope as a proxy for EF and Gh respectively"
+        gw.DG.set_channel_delay(gw.DG.Channel.A, gw.DG.Channel.T0, (init_duration - 380e-3) * 1e-6) #20ns = cable delay from DG to MW o/p
+        gw.DG.set_channel_delay(gw.DG.Channel.B, gw.DG.Channel.T0, (init_duration - 380e-3)* 1e-6 + (total_duration_s))  # 20ns = cable delay from DG to MW o/p
+        gw.DG.set_channel_delay(gw.DG.Channel.C, gw.DG.Channel.T0, (init_duration - laser_delay * 1e-3) * 1e-6) #20ns = cable delay from DG to MW o/p
+        gw.DG.set_channel_delay(gw.DG.Channel.D, gw.DG.Channel.T0, (init_duration* 1e-6 + total_duration_s - 30e-9))  # 20ns = cable delay from DG to MW o/p
+        
+        gw.DG.set_channel_delay(gw.DG.Channel.E, gw.DG.Channel.T0, (init_duration - 380e-3) * 1e-6) #20ns = cable delay from DG to MW o/p
+        gw.DG.set_channel_delay(gw.DG.Channel.F, gw.DG.Channel.T0, (init_duration - 380e-3)* 1e-6 + (total_duration_s))  # 20ns = cable delay from DG to MW o/p
+        
+        gw.DG.set_channel_delay(gw.DG.Channel.G, gw.DG.Channel.T0, (init_duration - laser_delay * 1e-3) * 1e-6) # 30ns = cable delay from DG to Laser; + 110 ns = Laser fall time; This makes up total Laser delay
+        gw.DG.set_channel_delay(gw.DG.Channel.H, gw.DG.Channel.T0, (init_duration* 1e-6 + total_duration_s - 30e-9))  # 30ns = cable delay from DG to Laser
+        
+        gw.DG.set_display(gw.DG.DisplayMode.CHANNEL_DELAY, gw.DG.Channel.F)
+
+        # Configure SR400
+        gw.SR.set_discriminator_mode('A', 0)
+        gw.SR.set_discriminator_mode('B', 0)
+              
+        gw.SR.set_gate_mode('A', 1)
+        gw.SR.set_gate_mode('B', 1)
+     
+        gw.SR.set_disc_level('A', 0.15)
+        gw.SR.set_disc_level('B', 0.15)
+        
+        gw.SR.set_count_mode(0)
+       
+        gw.SR.set_count_input('A', 'INPUT1')
+        gw.SR.set_count_input('B', 'INPUT1')
+        
+        gw.SR.set_count_input('T', 'TRIG')
+        gw.SR.set_preset_count('T', burst_count - 1)
+
+        gw.SR.set_gate_delay('A', (init_duration*1e-6 + total_duration_s + 50*1e-9)) #50 ns = Laser rise time     
+        gw.SR.set_gate_width('A', gate_duration * 1e-6)
+               
+        gw.SR.set_gate_delay('B', (init_duration + reinit_duration + gate_duration) * 1e-6 + total_duration_s)
+        gw.SR.set_gate_width('B', gate_duration * 1e-6)
+                
+        # Configure SG396
+        gw.SG.setModType(gw.SG.MODULATION_TYPE['QAM'])
+        gw.SG.set_vector_ModFunction('5')
+        gw.SG.setRfAmp(mw_power)
+        
+        for channel in [1, 2]:
+            
+            # Configure waveform as pulse
+            gw.AFG.set_function(channel, "PULSe")
+            gw.AFG.set_frequency(channel, 1/total_duration_s)  # 1 MHz base frequency
+                
+            # Set amplitude to the specified Vpp
+            gw.AFG.set_amplitude(channel, 0.5, "VPP")
+                
+            # Set offset to ensure low level is at 0V
+            gw.AFG.set_offset(channel, 0.25)
+                
+            # Set pulse width
+            gw.AFG.set_pulse_width(channel, 100e-9)
+            gw.AFG.set_pulse_delay(channel, 5) #270 ns delay because of the AFG. Can be optimized further.
+                        
+            # Configure burst mode
+            gw.AFG.set_burst_state(channel, True)
+            gw.AFG.set_burst_mode(channel, "TRIGGERED")
+            gw.AFG.set_burst_count(channel, 1)  # Single pulse per trigger
+            gw.AFG.set_trigger_source("EXTERNAL")
+            gw.AFG.set_trigger_slope("POSITIVE")
+                
+            # Enable output
+            gw.AFG.set_output_state(channel, True)
+        
+                 
+    def update_plot(self):
+        self.line_ratio.set_data(self.echo_times, self.ratios)
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.canvas.draw()
+        self.canvas.flush_events()
+        
+    # def perform_optimization(self):
+    #     # Pause ODMR measurement
+    #     self.gw.SG.setRfToggle(False)
+        
+    #     # Run FSM scan
+    #     fsm_window = tk.Toplevel(self.master)
+    #     fsm_scanner = FSMScannerGUI(fsm_window)
+    #     fsm_scanner.start_scan()
+    #     self.master.wait_window(fsm_window)
+        
+    #     # Focus at coordinates with highest counts
+    #     fsm_scanner.focus()
+        
+    #     # Run autofocus
+    #     autofocus_window = tk.Toplevel(self.master)
+    #     autofocus = AutofocusWindow()
+    #     autofocus.show()
+    #     self.master.wait_window(autofocus_window)
+        
+    #     # Resume ODMR measurement
+    #     self.gw.SG.setRfToggle(True)
+        
+    #     print("Optimization completed. Resuming ODMR measurement.")
+
+    def run_experiment(self, fixed_freq, start_time, stop_time, step_size, burst_count, mw_power, 
+                       init_duration, laser_delay, gate_duration, reinit_duration):
+        echo_time_range = np.arange(start_time, stop_time + step_size, step_size)
+        
+        with MyInstrumentManager() as self.gw, DataSource('rabi_data') as data_source:
+            try:
+                self.gw.SG.setFrequency(fixed_freq * 1000, 'MHz')  # Set fixed frequency
+                self.ax.set_xlim(start_time, stop_time)
+                
+                self.gw.AFG.clear()
+
+                for echo_time in echo_time_range:
+                    if not self.running:
+                        break
+                    
+                    R1s = []  # List to store 1000 ratio values
+                    R2s = []
+                    
+                    for i in range(50):
+                        print(f"Iteration {i+1}/50 for echo_time {echo_time}")
+                        
+                        # Seq 1 for 1 state relaxation to 0 state with pi pulse
+                        total_duration_s = (5 + 100 + echo_time) * 1e-9
+                        burst_period = (init_duration + gate_duration + reinit_duration + gate_duration + 1) * 1e-6 + total_duration_s
+                        
+                        self.setup_instruments(self.gw, burst_period, burst_count, mw_power, init_duration, total_duration_s, laser_delay, gate_duration, reinit_duration, stop_time)
+                        self.gw.SG.setRfToggle(True)
+                        self.gw.SR.count_reset()             
+                        self.gw.SR.start_counting()
+                        self.gw.DG.trigger()
+                    
+                        measurement_time = burst_count * burst_period
+                        time.sleep(measurement_time)
+                        
+                        a1_count = self.gw.SR.read_counts('A')
+                        b1_count = self.gw.SR.read_counts('B')
+                        R1 = a1_count/b1_count
+                                                
+                        R1s.append(R1)
+                        
+                        self.gw.SG.setRfToggle(False)
+                        
+                        # Seq 2 for 0 state relaxation to 1 state aka no pi pulse
+                        total_duration_s = echo_time * 1e-9
+                        burst_period = (init_duration + gate_duration + reinit_duration + gate_duration + 1) * 1e-6 + total_duration_s
+                        
+                        self.setup_instruments(self.gw, burst_period, burst_count, mw_power, init_duration, total_duration_s, laser_delay, gate_duration, reinit_duration, stop_time)
+                        self.gw.SG.setRfToggle(False)
+                        self.gw.SR.start_counting()
+                        self.gw.DG.trigger()
+                    
+                        measurement_time = burst_count * burst_period
+                        time.sleep(measurement_time)
+                        
+                        a0_count = self.gw.SR.read_counts('A')
+                        b0_count = self.gw.SR.read_counts('B')
+                        R2 = a0_count/b0_count
+                        
+                        R2s.append(R2)
+                                                                    
+                    # Calculate averages                                  
+                    avg_R1 = sum(R1s) / len(R1s)
+                    avg_R2 = sum(R2s) / len(R2s)
+                    ratio = (avg_R1-avg_R2)/(avg_R1+avg_R2) if (avg_R1+avg_R2) != 0 else 0
+                    print(ratio)
+                    self.ratios.append(ratio)
+                    self.echo_times.append(echo_time)
+                                        
+                    data_source.push({
+                        'echo_time': echo_time,
+                        'ratio': ratio,
+                        'counts_a': R1,  # Note: This will be the last R1 value
+                        'counts_b': R2   # Note: This will be the last R2 value
+                    })
+                
+                    self.master.after(0, self.update_plot)
+
+                self.gw.SG.setRfToggle(False)
+                
+                # Disable AFG outputs
+                for channel in [1, 2]:
+                    self.gw.AFG.set_output_state(channel, False)
+                
+            except Exception as e:
+                messagebox.showerror("Experiment Error", f"Error during experiment: {str(e)}")
+        
+        self.gw = None
+        self.master.after(0, self.finish_experiment)
+
+    def start_experiment(self):
+        self.running = True
+        self.start_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL)
+        self.echo_times = []
+        self.ratios = []
+        
+        # Get parameters from UI
+        try:
+            self.experiment_params = {key.strip(':'): self.entries[key].get() for key in self.entries}
+            
+            # Convert to appropriate types
+            for key in ["Fixed Freq (GHz)", "Start Time (ns)", "Stop Time (ns)", "Step Size (ns)",
+                       "MW Power (dBm)", "Init Duration (µs)", "Laser Delay (ns)", 
+                       "Gate Duration (µs)", "Reinit Duration (µs)"]:
+                self.experiment_params[key.strip(':')] = float(self.experiment_params[key.strip(':')])
+            
+            self.experiment_params["Burst Count"] = int(self.experiment_params["Burst Count"])
+            
+            params = [
+                self.experiment_params["Fixed Freq (GHz)"],
+                self.experiment_params["Start Time (ns)"],
+                self.experiment_params["Stop Time (ns)"],
+                self.experiment_params["Step Size (ns)"],
+                self.experiment_params["Burst Count"],
+                self.experiment_params["MW Power (dBm)"],
+                self.experiment_params["Init Duration (µs)"],
+                self.experiment_params["Laser Delay (ns)"],
+                self.experiment_params["Gate Duration (µs)"],
+                self.experiment_params["Reinit Duration (µs)"]
+            ]
+            
+            threading.Thread(target=self.run_experiment, args=tuple(params), daemon=True).start()
+        except ValueError as e:
+            messagebox.showerror("Input Error", f"Invalid parameter format: {str(e)}")
+            self.enable_start_button()
+
+    def stop_experiment(self):
+        self.running = False
+        self.stop_button.config(state=tk.DISABLED)
+        if self.gw:
+            self.gw.SG.setRfToggle(False)
+            # Disable AFG outputs
+            try:
+                for channel in [1, 2]:
+                    self.gw.AFG.set_output_state(channel, False)
+            except:
+                pass
+
+    def finish_experiment(self):
+        self.enable_start_button()
+        if self.echo_times and messagebox.askyesno("Save Data", "Do you want to save the measurement data?"):
+            self.save_data()
+
+    def enable_start_button(self):
+        self.start_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+
+    def save_data(self):
+        file_path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json"), ("CSV files", "*.csv")])
+        if file_path:
+            if file_path.endswith('.json'):
+                self.save_json(file_path)
+            else:
+                self.save_csv(file_path)
+
+    def save_json(self, file_path):
+        data = {
+            "parameters": self.experiment_params,
+            "data": [{"echo_time": d, "ratio": r} for d, r in zip(self.echo_times, self.ratios)]
+        }
+        with open(file_path, 'w') as f:
+            json.dump(data, f, indent=2)
+        messagebox.showinfo("Save Data", f"Data saved to {file_path}")
+
+    def save_csv(self, file_path):
+        with open(file_path, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["# Experiment Parameters"])
+            for key, value in self.experiment_params.items():
+                writer.writerow([f"# {key}: {value}"])
+            writer.writerow([])
+            writer.writerow(["Echo Time (ns)", "Ratio (A/B)"])
+            for duration, ratio in zip(self.echo_times, self.ratios):
+                writer.writerow([duration, ratio])
+        messagebox.showinfo("Save Data", f"Data saved to {file_path}")
+
+def main():
+    root = tk.Tk()
+    experiment = T1Experiment(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
